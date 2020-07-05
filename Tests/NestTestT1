@@ -1,0 +1,3 @@
+Echo Tail calling...
+SetEval Test$Count Test$Count + 1
+If Test$Count < Test$Limit THEN BASIC -quit <Obey$Dir>.NestTestT2 ELSE Echo Reach deepest nesting

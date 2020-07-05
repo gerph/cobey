@@ -1,0 +1,23 @@
+@ Assembler veneer for exit handler
+
+.global exit_veneer
+exit_veneer:
+	@ On entry USR, R12 points to an wk struct (this)
+	@ This depends on a specific arrangement of struct workspace
+	ADD	R13,R12,#4
+	ADD	R13,R13,#(4*1024)
+	ADD	R10,R12,#4
+	MOV	R11,#0
+	MOV	R0,R12
+        LDR	R12,[R12]
+	LDR	R12,[R12]
+	LDMIB	R12,{R1,R2}
+	@ This looks naughty since we never restore this
+	@ for whoever was there before us, but we never return
+	@ to whoever was on the SVC stack before us so I think
+	@ this is ok.
+	STMIA	R10,{R1,R2}
+	.word	_Lib$Reloc$Off$DP + 0xE28AA000
+	BL	exit_handlerC
+	MOV	PC,#0
+	@ Shouldn't get here

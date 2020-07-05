@@ -1,0 +1,11 @@
+ReadMe for Tests
+======
+
+Before running a script, use SetTestCObey to test CObey or use SetTestObey to test Obey.
+
+CacheTest - doesn't work. I need to find an alternative method.
+NestTest - sees how many levels of nesting the module can do.
+NestTestM - the same, but using the -m option
+NestTestT - the same, but doing a tail call to a BASIC program
+
+NestTests will always crash if you have Test$Limit high enough. It keeps going until the SVC stack overflows. Use SetTestCObey and SetTestObey to compare how far the two modules get.

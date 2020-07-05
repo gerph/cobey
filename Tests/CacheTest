@@ -1,0 +1,18 @@
+| This test is useless. Obey itself passes without the -C option.
+| The delete fails silently because the file is open.
+| Though it is a demonstration of how an error doesn't always
+| make an Obeyfile immediately terminate.
+
+Set Test$File <Obey$Dir>.CacheTest2
+Echo CObey cache test
+Echo Making test obey <Test$File>
+Echo Echo In <Test$File> - deleting { > <Test$File> }
+Echo Delete <Test$File> { >> <Test$File> }
+Echo Echo Still in <Test$File> - test successful! { >> <Test$File> }
+Echo Made <Test$File>:
+Echo =====
+Type <Test$File>
+Echo =====
+Echo Running <Test$File>...
+Do <Test$Command> -C <Test$File>
+Echo Test complete.

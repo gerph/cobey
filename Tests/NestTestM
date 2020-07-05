@@ -1,0 +1,8 @@
+Echo CObey nest test
+SetEval Test$Count 0
+SetEVal Test$Limit 70
+Echo Starting test, limit <Test$Limit>...
+|Do <Test$Command> <Obey$Dir>.NestTest1
+Load <Obey$Dir>.NestTestM1 8000
+Do <Test$Command> -m &8000
+Echo Test complete.

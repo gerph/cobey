@@ -1,0 +1,5 @@
+Show Test$Count
+SetEval Test$Count Test$Count + 1
+| Now for a tail call
+If Test$Count > Test$Limit Then Echo Reached deepest nesting Else Do <Test$Command> <Obey$Dir>.NestTest1
+Echo Stepping out

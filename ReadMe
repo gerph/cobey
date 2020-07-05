@@ -1,0 +1,20 @@
+CObey 0.01
+==========
+
+This is the Obey 0.40 module rewritten in C.
+
+To give it a good exercising, restart to the supervisor prompt (e.g. *Configure NoBoot) and do
+
+*RMKill Obey
+*RMLoad $.path.to.CObey
+*!Boot
+
+Remember that if you have both Obey and CObey loaded you can control which one the command goes to by 
+
+*CObey:Obey
+
+or 
+
+*Obey:Obey
+
+However, if your Obeyfile itself contains *Obey somewhere, then that will get sent to whichever module gets priority. This may mess things up.

@@ -1,0 +1,8 @@
+| Test tail calls from nested obeys (using BASIC program as tail call)
+Echo CObey nest test, tail
+SetEval Test$Count 0
+SetEVal Test$Limit 70
+Echo Starting test, limit <Test$Limit>...
+Do <Test$Command> <Obey$Dir>.NestTestT1
+Echo Tail calls done?
+Echo Test complete.

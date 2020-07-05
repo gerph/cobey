@@ -1,0 +1,814 @@
+/*
+ Original assembler source - Copyright 1996 Acorn Computers Ltd
+ Translated to C - Copyright 2020 Julie Stamp
+
+ Licensed under the Apache License, Version 2.0 (the "License")
+ you may not use this file except in compliance with the License.
+ You may obtain a copy of the License at
+
+     http://www.apache.org/licenses/LICENSE-2.0
+
+ Unless required by applicable law or agreed to in writing, software
+ distributed under the License is distributed on an "AS IS" BASIS,
+ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ See the License for the specific language governing permissions and
+ limitations under the License.
+*/
+
+  /* TODO
+  - Consider uniqueness etc. in find_exit
+  - Report an error code after mallocs (does Obey?)
+   */
+
+//#define TRACE 1
+
+#define ErrorNumber_CantKill 0x103
+
+/* From CLib */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* Local */
+#include "module.h"
+#include "veneer.h"
+
+/* From OSLib */
+#include <oslib/osmodule.h>
+#include <oslib/osfind.h>
+#include <oslib/osgbpb.h>
+#include <oslib/os.h>
+#include <oslib/osbyte.h>
+#include <oslib/fileswitch.h>
+#include <oslib/osfscontrol.h>
+#include <oslib/resourcefs.h>
+#include <oslib/osargs.h>
+#include <oslib/messagetrans.h>
+#include <trace.h>
+
+#define CLI_SIZE 1024
+#define PATH_LENGTH 512
+#define ERRORV 1
+#define UPCALLV 29
+#define UPCALL_NEWAPPLICATION 256
+#define OBEYDIR_VARIABLE "Obey$Dir"
+#define CSD_NAME "@"
+
+#define PSR_CARRY 1 << 29
+
+#define OP_MEM 0
+#define OP_FILE 1
+
+#define FLAG_LIVE 1 << 0
+#define FLAG_USEEXIT 1 << 1
+#define FLAG_VERBOSE 1 << 2
+#define FLAG_CACHE 1 << 3
+#define FLAG_RESFS 1 << 4
+#define FLAG_MEMORY 1 << 5
+
+
+#define ARG_MEM 1 << 0
+#define ARG_CACHE 1 << 1
+#define ARG_VERBOSE 1 << 2
+
+typedef struct workspace
+{
+  /* Be careful if reordering members,
+    the assembler exit veneer relies on the
+    stack being in a particular place */
+  void *pw;
+  /* TODO how much to do we really need? */
+  byte stack[4*1024];
+  struct workspace *next;
+
+  asm_routine old_exit_handler;
+  byte *old_exit_handle;
+  byte *old_exit_buffer;
+
+  asm_routine old_error_handler;
+  byte *old_error_handle;
+  byte *old_error_buffer;
+
+  os_fw file_handle;
+  bits flags;
+
+  char args[CLI_SIZE];
+  char inputcom[CLI_SIZE];
+  char outputcom[CLI_SIZE];
+
+  osbool verbose;
+
+  char *cache_block;
+  unsigned int cache_ptr;
+  unsigned int cache_ext;
+} wk;
+
+typedef struct
+{
+  char const *filename;
+  osbool cache;
+} file_args_t;
+
+typedef struct
+{
+  char const *source;
+} mem_args_t;
+
+typedef struct
+{
+  int op;
+  osbool verbose;
+  union
+  {
+    file_args_t file;
+    mem_args_t mem;
+  } args;
+  char const *tail;
+} operation_t;
+
+os_error *lookup_error(bits errnum, char const *token);
+
+os_error *read_from_file(wk *this, char const *filename, osbool cache);
+os_error *read_from_memory(wk *this, char const *address);
+
+os_error *process_lines(wk *this);
+osbool process_char(char c, char **d);
+
+os_error *find_exit(wk **item);
+os_error *find_error(wk **item);
+osbool find_item(wk *item);
+void find_undone(wk **item);
+
+os_error *set_obeydir(const char *filename);
+os_error *close_obey(wk *this, osbool freemem);
+
+os_error *set_exit_handler(wk *this);
+os_error *set_error_handler(wk *this);
+os_error *restore_exit_handler(wk *this);
+os_error *restore_error_handler(wk *this);
+
+void link_item(wk *this);
+void unlink_item(wk *this);
+
+static wk *first = NULL;
+
+/* Obey command
+- If list empty, install exit handlers etc.
+- Link a new block into the list
+- Open the file
+- Call line processing loop
+- Return if get back here
+*/
+os_error *main_command(const char *arg_string, int argc, int number, void *pw)
+{
+  os_error *error = NULL;
+  wk *this = NULL;
+
+  const char *p;
+  bits args = 0;
+  operation_t op = { .op = OP_FILE, .verbose = FALSE };
+
+  if(argc == 0)
+  {
+    tracef("No command line argument supplied\n");
+    while(1)
+    {
+      this = NULL;
+      error = find_exit(&this);
+      if(!this) break;
+      close_obey(this, TRUE);
+     }
+     return error;
+  }
+
+  p = arg_string;
+  while(*p == '-')
+  {
+    p++;
+    /*TODO handle spacey case*/
+    switch(*p++)
+    {
+      case 'v':
+      case 'V': args |= ARG_VERBOSE;
+                op.verbose = TRUE;
+                break;
+      case 'c':
+      case 'C': args |= ARG_CACHE;
+                tracef("Cache\n");
+                break;
+      case 'm':
+      case 'M': args |= ARG_MEM;
+                tracef("Memory\n");
+                break;
+      default: tracef("Unknown option\n");
+    }
+  }
+  while(*p == ' ') p++;
+  /* Now p points to filename or address */
+  if(args & ARG_MEM)
+  {
+    op.op = OP_MEM;
+    char *end; /* Dummy */
+    error = xos_read_unsigned(
+          os_READ_CONTROL_TERMINATED,
+          p,
+          -1,
+          &end,
+          (bits *)&op.args.mem.source);
+    if(error) goto finish;
+  }
+  else
+  {
+    op.op = OP_FILE;
+    op.args.file.filename = p;
+    op.args.file.cache = args & ARG_CACHE;
+  }
+  while(*p > ' ') p++;
+  op.tail = p;
+
+  if(!(this = malloc(sizeof(wk))))
+  {
+    tracef("Couldn't allocate workspace to open Obey file\n");
+    goto finish;
+  }
+  this->next = NULL;
+  this->cache_block = NULL;
+  this->pw = pw;
+  this->file_handle = (os_fw) NULL;
+  this->flags = FLAG_LIVE;
+  strcpy(this->args, op.tail);
+  this->verbose = op.verbose;
+  this->cache_ptr = 0;
+
+  if(op.op == OP_FILE) /* Read from an Obeyfile */
+  {
+    error = set_obeydir(op.args.file.filename);
+    if(error) goto finish;
+    /* Do this first so we don't have to unlink/release
+      everything if there's a problem with os_find */
+    error = read_from_file(this, op.args.file.filename, op.args.file.cache);
+    if(error) goto finish;
+  }
+  else /* Read directly from memory into a cache block */
+  {
+    error = read_from_memory(this, op.args.mem.source);
+    if(error) goto finish;
+  }
+
+  set_exit_handler(this);
+  set_error_handler(this);
+
+  if(!first)
+  {
+    tracef("OS_Claiming...\n");
+    xos_claim(ERRORV,(asm_routine)errorvec,(byte *)pw);
+    xos_claim(UPCALLV,(asm_routine)upcallvec,(byte *)pw);
+  }
+  link_item(this);
+
+  error = process_lines(this);
+
+finish:
+  if(this) free(this);
+  if(error) tracef("CObey error:%s\n" _ error->errmess);
+  return error;
+}
+
+os_error *read_from_file(wk *this, char const *filename, osbool cache)
+{
+  os_error *error = NULL;
+  os_fw handle = (os_fw) NULL;
+  os_fw resfs_data;
+  int info_word;
+  int unread;   /* Dummy variable */
+
+  error = xosfind_openinw(
+          osfind_ERROR_IF_ABSENT | osfind_ERROR_IF_DIR,
+          filename,
+          "",
+          &handle);
+  tracef("handle %d\n" _ handle);
+  if(error || handle == 0) return error;
+  this->file_handle = handle;
+  xosfscontrol_read_fs_handlew(handle,&resfs_data,&info_word);
+  if(info_word & 0xFF == 46)
+  {
+    resourcefs_file_data *f = (resourcefs_file_data*)(((void*)resfs_data) - 4);
+    this->cache_block = (void*)f->data;
+    this->cache_ext = f->size;
+    this->flags |= FLAG_RESFS;
+  }
+  if(cache)
+  {
+    error = xosargs_read_extw(handle,&this->cache_ext);
+    if(error) return error; /* TODO error shouldn't finish on these */
+    if(!(this->cache_block = malloc(this->cache_ext))) return error;
+
+    error = xosgbpb_readw(
+          handle,
+          this->cache_block,
+          this->cache_ext,
+          &unread);
+    xosfind_closew(handle);
+    this->file_handle = 0;
+    if(error) return error;
+  }
+  return error;
+}
+
+os_error *read_from_memory(wk *this, char const *source)
+{
+  os_error *error = NULL;
+
+  this->cache_ptr = 0;
+  this->cache_ext = strlen(source);
+  if(!(this->cache_block = malloc(this->cache_ext)))
+  {
+    /* TODO stick in an error */
+    return error;
+  }
+  memcpy(this->cache_block,source,this->cache_ext);
+  return error;
+}
+
+
+/* Tidy up
+- Close file
+- Read Die flag
+- Restore environment
+- Delink item and optionally free it
+- If list left empty, remove ErrorV and UpCallV claims
+- XOS_Exit if die flag
+- Otherwise just return
+*/
+os_error *close_obey(wk *this, osbool freemem)
+{
+  os_error *error = NULL;
+  if(this->file_handle)
+  {
+    error = xosfind_closew(this->file_handle);
+    this->file_handle = 0;
+    if(error) goto finish;
+  }
+  if(this->cache_block && !(this->flags & FLAG_RESFS))
+  {
+    free(this->cache_block);
+    this->cache_block = 0;
+  }
+  unlink_item(this);
+  if(!first)
+  {
+    tracef("OS_Releasing...\n");
+    xos_release(ERRORV,(asm_routine)errorvec,this->pw);
+    xos_release(UPCALLV,(asm_routine)upcallvec,this->pw);
+  }
+  restore_exit_handler(this);
+  restore_error_handler(this);
+  if(freemem) free(this);
+
+
+finish:
+  return error;
+}
+
+os_error *set_obeydir(const char *filename)
+{
+  os_error *error;
+  char path[PATH_LENGTH];
+  char c;
+  const char *d;
+  for(d = filename;(c = *d) > ' ';d++);
+  while((c=*d) != '.' && d-- >= filename);
+  /* d now points to the dot after the path we want */
+  memset(path,0,PATH_LENGTH);
+  if(d <= filename)
+  {
+    memcpy(path,CSD_NAME,2);
+  }
+  else
+  {
+    /* This assumes the path will never overflow */
+    memcpy(path,filename,d-filename);
+  }
+  tracef("set_obeydir: %s\n" _ path);
+  error = xos_set_var_val(
+        OBEYDIR_VARIABLE,
+        (byte const *) path,
+        0,
+        0,
+        os_VARTYPE_STRING,
+        NULL,
+        NULL);
+  return error;
+}
+
+/* Line processing loop
+- Read a line
+- XOS_CLI it
+- If XOS_CLI returns, carry on with next ine
+- If end of file reached, delink item, close file, XOS_Exit if die flag,
+ otherwise just return */
+os_error *process_lines(wk *this)
+{
+  tracef("process_lines\n");
+  os_error *error;
+  osbool die;
+  char c;
+  char *d;
+  int used;
+  bits psr;
+  osbool eof = FALSE;
+  while(!eof)
+  {
+    xos_read_escape_state(&psr);
+    if(psr & PSR_CARRY)
+    {
+      int r_dummy;
+      xos_byte(osbyte_ACKNOWLEDGE_ESCAPE,0,0,&r_dummy,&r_dummy);
+      error = lookup_error(error_ESCAPE,"Escape");
+      goto finish;
+    }
+
+    /* TODO check obey$dir behaviour for cache/memory*/
+    d = this->inputcom;
+    if(!this->cache_block) /* Read a line from a file */
+    {
+      while(1)
+      {
+        error =  xos_bgetw(this->file_handle,&c,&psr);
+        if(error) goto finish;
+        if(psr & PSR_CARRY) c = 0; /* Check for CS (no byte read) */
+        if(process_char(c,&d)) break;
+      }
+    }
+    else /* Read a line from the cache */
+    {
+      while(1)
+      {
+        if(this->cache_ptr >= this->cache_ext)
+        {
+          c = 0;
+        }
+        else
+        {
+          c = this->cache_block[this->cache_ptr++];
+        }
+        if(process_char(c,&d)) break;
+      }
+    }
+
+    error = xos_substitute_args32(
+          this->args,
+          this->outputcom,
+          CLI_SIZE,
+          this->inputcom,
+          strlen(this->inputcom),
+          os_SUBSTITUTE_ARGS_IGNORE_EXTRAS,
+          &used);
+    this->outputcom[used-1] = 0;
+    if(error) goto finish;
+
+    if(this->verbose)
+    {
+      printf("Obey:%s\n",this->outputcom);
+    }
+
+    if(this->file_handle)
+    {
+      error = xosargs_read_eof_statusw(this->file_handle,&eof);
+      if(error) goto finish;
+    }
+    else
+    {
+      eof = (this->cache_ptr>=this->cache_ext)? -1 : 0;
+    }
+    if(eof) this->flags &= ~FLAG_LIVE;
+
+    error = xos_cli(this->outputcom);
+    if(error) goto finish;
+
+    /* *Obey might have been called and removed us */
+    if(!find_item(this)) goto finish;
+   /* if(!(this->flags & FLAG_LIVE)) goto finish;*/
+  }
+finish:
+  die = this->flags & FLAG_USEEXIT; /* Remember flag because about to free ou
+ rself */
+  /* Check if an *Obey line has removed our block, or
+    a line *Quitted */
+  if(find_item(this))
+  {
+    close_obey(this, TRUE);
+  }
+  if(die)
+  {
+    xos_exit((os_error *)NULL,0);
+  }
+  return error;
+}
+
+osbool process_char(char c, char **d)
+{
+  osbool done = FALSE;
+  if(c == 9) c = ' ';
+  if(c >= ' ')
+  {
+    **d = c;
+  }
+  else
+  {
+    **d = 0;
+    done = TRUE;
+  }
+  (*d)++;
+  return done;
+}
+
+os_error *set_exit_handler(wk *this)
+{
+  return xos_change_environment(
+        os_HANDLER_EXIT,
+        (asm_routine) exit_veneer,
+        (byte *) this,
+        (byte *) this,
+        &(this->old_exit_handler),
+        &(this->old_exit_handle),
+        &(this->old_exit_buffer));
+}
+
+os_error *set_error_handler(wk *this)
+{
+  return xos_change_environment(
+        os_HANDLER_ERROR,
+        (asm_routine) this,
+        (byte *) this,
+        (byte *) this,
+        &(this->old_error_handler),
+        &(this->old_error_handle),
+        &(this->old_error_buffer));
+}
+
+os_error *restore_exit_handler(wk *this)
+{
+  os_error *error;
+   error = xos_change_environment(
+        os_HANDLER_EXIT,
+        this->old_exit_handler,
+        this->old_exit_handle,
+        this->old_exit_buffer,
+        /* Need some arguments, and we're not using these anymore */
+        &(this->old_exit_handler),
+        &(this->old_exit_handle),
+        &(this->old_exit_buffer));
+  return error;
+}
+
+os_error *restore_error_handler(wk *this)
+{
+  os_error *error;
+   error = xos_change_environment(
+        os_HANDLER_ERROR,
+        this->old_error_handler,
+        this->old_error_handle,
+        this->old_error_buffer,
+        &(this->old_error_handler),
+        &(this->old_error_handle),
+        &(this->old_error_buffer));
+  return error;
+}
+
+void link_item(wk *this)
+{
+  wk *current = first;
+  wk **item = &first;
+  while(current)
+  {
+    item = &(current->next);
+    current = current->next;
+  }
+  *item = this;
+}
+
+void unlink_item(wk *this)
+{
+  wk *current;
+  wk **item = &first;
+  for(current = first;current != 0; current=current->next)
+  {
+    tracef("unlink walk: current %p this %p item %p next %p\n" _ current _ this _ item _ current->next);
+    if(current == this)
+    {
+      *item = current->next;
+      tracef("current %p\n" _ current);
+      return;
+    }
+    item = &(current->next);
+  }
+  if(!current)
+  {
+    fprintf(stderr,"Cobey Panic: Couldn't find item to unlink\n");
+  }
+}
+
+/* Find the first item in the list that
+  matches the current handle
+  (asm version looks for handler instead)
+*/
+os_error *find_exit(wk **item_out)
+{
+  os_error *error;
+  asm_routine exit_handler;
+  byte *exit_handle; /* Dummy */
+  byte *exit_buffer; /* Dummy */
+
+  error = xos_change_environment(
+        os_HANDLER_EXIT,
+        0,
+        0,
+        0,
+        &exit_handler,
+        &exit_handle,
+        &exit_buffer);
+  if(error) goto finish;
+  tracef("find_exit: exit_handler %p exit_handle %p\n"
+           _  exit_handler _ exit_handle);
+
+  *item_out = find_item((wk*)exit_handle)? (wk*)exit_handle : NULL;
+  if(!*item_out) tracef("find_exit: item not found\n");
+
+finish:
+   return error;
+}
+
+void find_undone(wk **item)
+{
+  wk *current = first;
+  while(current)
+  {
+    if(current->old_exit_handler == (asm_routine) -1)
+    {
+      *item = current;
+      return;
+    }
+    current = current->next;
+  }
+}
+
+osbool find_item(wk *item)
+{
+  wk *current = first;
+  while(current)
+  {
+    if(current == item) return TRUE;
+    current = current->next;
+  }
+  return FALSE;
+}
+
+/* Find the first item in the list that
+  matches the current handle
+  (asm version looks for handler instead)
+*/
+os_error *find_error(wk **item_out)
+{
+  os_error *error;
+  asm_routine error_handler; /* Dummy */
+  byte *error_handle;
+  byte *error_buffer; /* Dummy */
+
+  error = xos_change_environment(
+        os_HANDLER_ERROR,
+        0,
+        0,
+        0,
+        &error_handler,
+        &error_handle,
+        &error_buffer);
+   if(error) goto finish;
+   tracef("find_error: error_handler %p error_handle %p\n" _  error_handler _ error_handle);
+
+  *item_out = find_item((wk*)error_handler)? (wk*)error_handler : NULL;
+  if(!*item_out) tracef("find_error: item not found\n");
+
+finish:
+   return error;
+}
+
+/* Exit handler
+- Set die flag
+- Enter line processing loop
+- Mustn't reach here
+*/
+void exit_handlerC(wk *this)
+{
+  os_error *error = NULL;
+
+  tracef("CObey:Exit handler\n");
+  this->flags |= FLAG_USEEXIT;
+  if(this->flags & FLAG_LIVE)
+  {
+    process_lines(this);
+  }
+  else
+  {
+    close_obey(this,TRUE);
+    error = xos_exit((os_error*)NULL,0);
+  }
+  printf("CObey panic: Returned to exit handler!\n");
+}
+
+/* Couldn't call it errorv because oslib has that already */
+int errorvec_handler(os_register_block *r, void *pw)
+{
+  os_error *error;
+  wk *this;
+  tracef("ErrorV handler\n");
+  while(1)
+  {
+    this = NULL;
+    error = find_error(&this);
+    if(error || !this) return VECTOR_PASSON;
+    close_obey(this, TRUE);
+  }
+}
+
+/* A line in the file might be starting a new application,
+  so we need to temporarily take our environment out the way
+  and put the calling one back in, so it can deal with this.
+  Later Service_NewApplication will be issued, when we
+  will put ourself back in */
+int upcallvec_handler(os_register_block *r, void *pw)
+{
+  os_error *error;
+  wk *this = NULL;
+  if(r->registers[0] != UPCALL_NEWAPPLICATION) return VECTOR_PASSON;
+  tracef("UpCallV handler %d\n" _ r->registers[0]);
+  error = find_exit(&this);
+  if(error || !this) return VECTOR_PASSON;
+  restore_exit_handler(this);
+  restore_error_handler(this);
+  /* Mark handlers as temporarily removed */
+  this->old_exit_handler = (asm_routine) -1;
+  return VECTOR_PASSON;
+}
+
+/* We might have taken ourselves out the way for an UpCall_NewApplication.
+  If so, we now put ourself back */
+void service_newapplication_handler(int service, os_register_block *r,
+                                    void *pw)
+{
+  os_error *error;
+  wk *this = NULL;
+  if(!first) return;
+  tracef("service_newapplication_handler %d\n" _ service);
+  /* asm version carries on looking after one block redone,
+    but this doesn't make sense the way I have set things up:
+    the upcall handler will only undo one block */
+  while(1)
+  {
+    this = NULL;
+    find_undone(&this);
+    if(!this) break;
+    set_exit_handler(this);
+    set_error_handler(this);
+  }
+  while(1)
+  {
+    this = NULL;
+    find_exit(&this);
+    if(!this) break;
+    /* Handle tail calls */
+    if(!(this->flags & FLAG_LIVE))
+    {
+      tracef("Handling tail call in Service_NewApplication\n");
+      close_obey(this,TRUE);
+    }
+    else
+    {
+      break;
+    }
+  }
+}
+
+os_error *module_final(int fatal, int podule_base, void *pw)
+{
+  os_error *error = NULL;
+  if(first)
+  {
+    error = lookup_error(ErrorNumber_CantKill, "ModInUs");
+  }
+  return error;
+}
+
+/* Length of token must be <= 252 */
+os_error *lookup_error(bits errnum, char const *token)
+{
+  os_error e = { .errnum = errnum };
+  strcpy(e.errmess, token);
+  return xmessagetrans_error_lookup(
+          &e,
+          NULL,
+          NULL,
+          0,
+          Module_Title,NULL,NULL,NULL);
+}

@@ -1,0 +1,7 @@
+Echo CObey nest test
+SetEval Test$Count 0
+SetEVal Test$Limit 120
+Echo Starting test, limit <Test$Limit>...
+Do <Test$Command> <Obey$Dir>.NestTest1
+Echo Tail calls done?
+Echo Test complete, limit <Test$Limit>.

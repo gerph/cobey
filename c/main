@@ -20,7 +20,7 @@
   - Report an error code after mallocs (does Obey?)
    */
 
-//#define TRACE 1
+#define TRACE 1
 
 #define ErrorNumber_CantKill 0x103
 
@@ -34,17 +34,46 @@
 #include "veneer.h"
 
 /* From OSLib */
-#include <oslib/osmodule.h>
-#include <oslib/osfind.h>
-#include <oslib/osgbpb.h>
-#include <oslib/os.h>
-#include <oslib/osbyte.h>
-#include <oslib/fileswitch.h>
-#include <oslib/osfscontrol.h>
-#include <oslib/resourcefs.h>
-#include <oslib/osargs.h>
-#include <oslib/messagetrans.h>
-#include <trace.h>
+#include <OSLib/Core/osmodule.h>
+#include <OSLib/Computer/osfind.h>
+#include <OSLib/Computer/osgbpb.h>
+#include <OSLib/Core/os.h>
+#include <OSLib/Core/osbyte.h>
+#include <OSLib/Computer/fileswitch.h>
+#include <OSLib/Computer/osfscontrol.h>
+#include <OSLib/Computer/resourcefs.h>
+#include <OSLib/Computer/osargs.h>
+#include <OSLib/Core/messagetrans.h>
+//#include <trace.h>
+
+typedef void *asm_routine;
+typedef os_f os_fw;
+typedef bool osbool;
+
+#define xosfind_openinw xosfind_openin
+#define xosfind_closew xosfind_close
+#define xosfscontrol_read_fs_handlew xosfscontrol_read_fs_handle
+#define xosargs_read_extw xosargs_read_ext
+#define xosgbpb_readw xosgbpb_read
+#define xos_bgetw xos_bget
+#define xosargs_read_eof_statusw xosargs_read_eof_status
+#define os_SUBSTITUTE_ARGS_IGNORE_EXTRAS (1<<31)
+#undef _C
+#undef _Z
+#undef _N
+#include <swis.h>
+#define xos_substitute_args32(_args, _result, _length, _template, _templatelen, _flags, _usedp) \
+    (os_error*)_swix(OS_SubstituteArgs32, _INR(0,5)|_OUT(2), \
+          (_args), (_result), (_length), (_template), (_templatelen), (_flags), \
+          (_usedp))
+
+
+#ifdef TRACE
+#define tracef if (1) printf
+#else
+#define tracef if (0) printf
+#endif
+
 
 #define CLI_SIZE 1024
 #define PATH_LENGTH 512
@@ -70,6 +99,7 @@
 #define ARG_MEM 1 << 0
 #define ARG_CACHE 1 << 1
 #define ARG_VERBOSE 1 << 2
+
 
 typedef struct workspace
 {
@@ -166,7 +196,9 @@ os_error *main_command(const char *arg_string, int argc, int number, void *pw)
 
   const char *p;
   bits args = 0;
-  operation_t op = { .op = OP_FILE, .verbose = FALSE };
+  operation_t op = {};
+  op.op = OP_FILE;
+  op.verbose = FALSE;
 
   if(argc == 0)
   {
@@ -207,14 +239,14 @@ os_error *main_command(const char *arg_string, int argc, int number, void *pw)
   /* Now p points to filename or address */
   if(args & ARG_MEM)
   {
-    op.op = OP_MEM;
     char *end; /* Dummy */
+    op.op = OP_MEM;
     error = xos_read_unsigned(
           os_READ_CONTROL_TERMINATED,
           p,
           -1,
           &end,
-          (bits *)&op.args.mem.source);
+          (void *)&op.args.mem.source);
     if(error) goto finish;
   }
   else
@@ -293,20 +325,20 @@ os_error *read_from_file(wk *this, char const *filename, osbool cache)
   xosfscontrol_read_fs_handlew(handle,&resfs_data,&info_word);
   if(info_word & 0xFF == 46)
   {
-    resourcefs_file_data *f = (resourcefs_file_data*)(((void*)resfs_data) - 4);
+    resourcefs_file_data *f = (resourcefs_file_data*)(((char*)resfs_data) - 4);
     this->cache_block = (void*)f->data;
     this->cache_ext = f->size;
     this->flags |= FLAG_RESFS;
   }
   if(cache)
   {
-    error = xosargs_read_extw(handle,&this->cache_ext);
+    error = xosargs_read_extw(handle, (void*)&this->cache_ext);
     if(error) return error; /* TODO error shouldn't finish on these */
     if(!(this->cache_block = malloc(this->cache_ext))) return error;
 
     error = xosgbpb_readw(
           handle,
-          this->cache_block,
+          (void*)this->cache_block,
           this->cache_ext,
           &unread);
     xosfind_closew(handle);
@@ -410,7 +442,6 @@ os_error *set_obeydir(const char *filename)
  otherwise just return */
 os_error *process_lines(wk *this)
 {
-  tracef("process_lines\n");
   os_error *error;
   osbool die;
   char c;
@@ -418,6 +449,9 @@ os_error *process_lines(wk *this)
   int used;
   bits psr;
   osbool eof = FALSE;
+
+  tracef("process_lines\n");
+
   while(!eof)
   {
     xos_read_escape_state(&psr);
@@ -803,7 +837,8 @@ os_error *module_final(int fatal, int podule_base, void *pw)
 /* Length of token must be <= 252 */
 os_error *lookup_error(bits errnum, char const *token)
 {
-  os_error e = { .errnum = errnum };
+  os_error e;
+  e.errnum = errnum;
   strcpy(e.errmess, token);
   return xmessagetrans_error_lookup(
           &e,

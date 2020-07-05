@@ -1,23 +1,30 @@
+# Makefile for CObey
 #
+
 #
+# Program specific options:
+#
+COMPONENT  = CObey
+CLEANTARGET = cleantarget
+EXPORTS    = 
+RESOURCES  = 
+LIBS       = ${OSLIB}
+INCLUDES   = OSLib:,<Lib$Dir>.
+USEOSLIB   = yes
+CDEFINES   = 
+OBJS       = o.main \
+             o.module \
+             o.veneer
 
-CC = gcc
-CMHG = cmunge -tgcc -32bit -zbase -zoslib
-CCFLAGS = -mhard-float -mlibscl -std=c99 -mmodule 
-AS = as -mfloat-abi=hard -mfpu=fpa
+include CModule
 
-all: cobey
+CMHGFLAGS_BASE += -zbase
 
-cobey: main.o module.o veneer.o
-	$(CC) $(CCFLAGS) -LOSLib: -lOSLib32 -LOSLibSupport: -lOSLibSupport32 -o CObey module.o main.o veneer.o
+cleantarget:
+       ${RM} h.module
 
-module.o: module.cmhg
-	$(CMHG) cmhg/module -s module.s -d module.h -o module.o
+# additional dependencies
+$(OZDIR).main: h.module
 
-%.o: %.c 
-	$(CC) $(CCFLAGS) -IOSLib: -IOSLibSupport: -o $@ -c $<
-
-veneer.o: veneer.s
-	$(AS) -o veneer.o veneer.s
-
-main.c:
+#---------------------------------------------------------------------------
+# Dynamic dependencies:

@@ -16,6 +16,8 @@ OBJS       = o.main \
              o.module \
              o.veneer
 
+FORTIFY    = yes
+
 include CModule
 
 CMHGFLAGS_BASE += -zbase

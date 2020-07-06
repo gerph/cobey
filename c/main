@@ -67,6 +67,8 @@ typedef bool osbool;
           (_args), (_result), (_length), (_template), (_templatelen), (_flags), \
           (_usedp))
 
+#include "fortify.h"
+
 
 #ifdef TRACE
 #define tracef if (1) printf
